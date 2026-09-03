@@ -1,0 +1,100 @@
+diff --git a/sys/dev/usb/net/if_axge.c b/sys/dev/usb/net/if_axge.c
+index cb8f0faff..6806f94c2 100644
+--- a/sys/dev/usb/net/if_axge.c
++++ b/sys/dev/usb/net/if_axge.c
+@@ -284,6 +284,47 @@ axge_write_cmd_2(struct axge_softc *sc, uint8_t cmd, uint16_t index,
+ 	axge_write_mem(sc, cmd, index, reg, &temp, 2);
+ }
+ 
++/*
++ * Serialise whole MII status passes.
++ *
++ * The MII layer keeps the media words in struct mii_data and assumes a pass
++ * over them is atomic under the driver lock.  That does not hold for a PHY
++ * reached over USB: every register access is a control transfer, and
++ * usbd_do_request_flags() drops the mutex it is handed while it waits.  The
++ * lock is therefore released and retaken at every register, mii_tick() and
++ * mii_pollstat() interleave, and one of them reads the other's half-built
++ * media word.
++ *
++ * The symptom is a storm of spurious link state changes.  The reader finds
++ * mii_media_active still holding the bare IFM_ETHER that ukphy_status()
++ * starts from, with no subtype set yet -- a value no completed pass leaves
++ * behind, since every path out of it sets either a subtype or IFM_NONE.
++ * mii_linkchg() reports the link as lost and the interface drops its address.
++ * It sustains itself, because reacting to a link change generally means
++ * querying the media, and that query is another concurrent pass.
++ *
++ * A second mutex cannot close this, as the transfer sleeps, so hold a flag
++ * across the pass and sleep on it with the driver lock.
++ */
++static void
++axge_mii_enter(struct axge_softc *sc)
++{
++
++	AXGE_LOCK_ASSERT(sc, MA_OWNED);
++	while (sc->sc_mii_busy != 0)
++		msleep(&sc->sc_mii_busy, &sc->sc_mtx, 0, "axgemii", hz / 4);
++	sc->sc_mii_busy = 1;
++}
++
++static void
++axge_mii_exit(struct axge_softc *sc)
++{
++
++	AXGE_LOCK_ASSERT(sc, MA_OWNED);
++	sc->sc_mii_busy = 0;
++	wakeup(&sc->sc_mii_busy);
++}
++
+ static int
+ axge_miibus_readreg(device_t dev, int phy, int reg)
+ {
+@@ -507,9 +548,11 @@ axge_ifmedia_upd(if_t ifp)
+ 	mii = GET_MII(sc);
+ 	AXGE_LOCK_ASSERT(sc, MA_OWNED);
+ 
++	axge_mii_enter(sc);
+ 	LIST_FOREACH(miisc, &mii->mii_phys, mii_list)
+ 	    PHY_RESET(miisc);
+ 	error = mii_mediachg(mii);
++	axge_mii_exit(sc);
+ 
+ 	return (error);
+ }
+@@ -526,9 +569,11 @@ axge_ifmedia_sts(if_t ifp, struct ifmediareq *ifmr)
+ 	sc = if_getsoftc(ifp);
+ 	mii = GET_MII(sc);
+ 	AXGE_LOCK(sc);
++	axge_mii_enter(sc);
+ 	mii_pollstat(mii);
+ 	ifmr->ifm_active = mii->mii_media_active;
+ 	ifmr->ifm_status = mii->mii_media_status;
++	axge_mii_exit(sc);
+ 	AXGE_UNLOCK(sc);
+ }
+ 
+@@ -768,7 +813,9 @@ axge_tick(struct usb_ether *ue)
+ 	mii = GET_MII(sc);
+ 	AXGE_LOCK_ASSERT(sc, MA_OWNED);
+ 
++	axge_mii_enter(sc);
+ 	mii_tick(mii);
++	axge_mii_exit(sc);
+ }
+ 
+ static u_int
+diff --git a/sys/dev/usb/net/if_axgereg.h b/sys/dev/usb/net/if_axgereg.h
+index 87e662b6c..42ad08c2e 100644
+--- a/sys/dev/usb/net/if_axgereg.h
++++ b/sys/dev/usb/net/if_axgereg.h
+@@ -204,6 +204,9 @@ struct axge_softc {
+ 	struct mtx		sc_mtx;
+ 	struct usb_xfer		*sc_xfer[AXGE_N_TRANSFER];
+ 
++	/* Held across a whole MII pass; see axge_mii_enter(). */
++	int			sc_mii_busy;
++
+ 	int			sc_flags;
+ #define	AXGE_FLAG_LINK		0x0001	/* got a link */
+ #define	AXGE_FLAG_178A		0x1000	/* AX88178A */

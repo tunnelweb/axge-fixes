@@ -1,0 +1,45 @@
+axge: fix throughput and stability on AX88179/AX88179B
+
+Four independent problems, found while getting an AX88179B to run at line
+rate on a gigabit WAN.
+
+1. The RX aggregation hold timer for SuperSpeed gigabit was 0x004f, which
+   is too short for the part to accumulate anything.  It emits one frame per
+   bulk transfer, so the link is limited by USB round trips rather than
+   bandwidth.  Sweeping the field live during a transfer:
+
+	0x004f -> 705 Mbps, 58k pkt/s
+	0x0100 -> 952 Mbps, 79k pkt/s
+	0x0400 -> 979 Mbps, 81k pkt/s
+	0x4000 -> 979 Mbps, 81k pkt/s
+
+   Returning to 0x004f reproduced the lower figure.  0x0400 reaches line
+   rate; larger values only add latency.
+
+2. axge_read_cmd_1() and axge_read_cmd_2() discarded the return value of
+   axge_read_mem() and returned the buffer regardless.  On failure that
+   buffer is uninitialised, so callers act on stack contents.  These are
+   control transfers sharing the bus with bulk traffic and they do fail
+   under load: the MII layer saw random link status and flapped the link
+   several hundred times during a saturating transfer, versus none at idle.
+   On a DHCP WAN the lease is lost when that happens.
+
+3. AXGE_PADDING was defined but never set.  The part waits for more data
+   when a frame plus its header is an exact multiple of wMaxPacketSize,
+   wedging the TX pipe until something resets it; the stack reports ENOBUFS
+   meanwhile.  Linux's ax88179_178a sets the bit under the same condition.
+
+4. Only one RX transfer was in flight, leaving the bulk IN endpoint unarmed
+   for the whole time the completion callback spends demultiplexing a burst.
+   Four matches if_ure(4)'s URE_MAX_RX.  Eight regressed badly, presumably
+   past what xhci(4) will keep on a bulk endpoint ring.
+
+Items 1, 2 and 4 are not specific to the B revision and should affect any
+axge device; item 3 was only observed there.
+
+Tested on: FreeBSD 15.1-RELEASE-p1 (OPNsense 26.7), ASIX AX88179B in a
+TP-Link UE306, 1000baseT full duplex over SuperSpeed, VLAN tagged WAN.
+Before: 57-73 Mbps with climbing input drops, and DHCP frequently failing
+outright; the documented workaround is a USB quirk forcing configuration 1
+so cdce(4) attaches instead, which is stable but limited to ~350 Mbps.
+After: 979 Mbps, no errors, no drops, no TCP retransmissions.

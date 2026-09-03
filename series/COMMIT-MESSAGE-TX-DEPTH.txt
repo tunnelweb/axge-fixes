@@ -1,0 +1,22 @@
+axge(4): keep four transmit transfers in flight
+
+The transmit path allocates a single bulk OUT transfer and gates its write
+callback on IFF_DRV_OACTIVE.  The flag is set as soon as a batch of packets is
+submitted and cleared only when that transfer completes, so for the whole time
+a batch is on the wire the driver declines further work and nothing is
+assembled behind it.  The endpoint falls idle between batches.
+
+This is the same shape as the receive limitation addressed earlier in this bug,
+where a single bulk IN transfer left the endpoint idle between completions.
+
+Allocate AXGE_N_TX_XFER transmit transfers and start, stall and stop all of
+them.  The OACTIVE gate goes with it.  With one transfer that flag was the
+serialisation, but with several it stops the remaining transfers picking up
+work while the first is in flight, which defeats the point of having them.  The
+send queue emptying ends the assembly loop on its own, so nothing is required
+in its place.  if_ure(4) keeps URE_MAX_TX transfers and is arranged the same
+way.
+
+Measured on an AX88179B at gigabit, transmit went from 250 to 465 Mbit/s.  That
+figure was taken over a WAN link through NAT and a VLAN tag rather than in
+isolation, so it indicates the direction rather than the ceiling.

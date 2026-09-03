@@ -1,0 +1,45 @@
+axge(4): serialise MII status passes
+
+The MII layer keeps the current media in struct mii_data and assumes that a
+pass over those fields is atomic under the driver lock.  That assumption does
+not hold when the PHY is reached over USB.  Every register access is a control
+transfer, and usbd_do_request_flags() drops the mutex it is handed while it
+waits for the transfer to complete, so the driver lock is released and
+reacquired at every single register.  mii_tick() and mii_pollstat() therefore
+interleave freely, and one of them reads the media words while the other is
+still building them.
+
+The result is a storm of spurious link state changes.  The torn read is easy
+to identify: mii_media_active comes back as a bare IFM_ETHER with no subtype,
+which is the value ukphy_status() assigns on entry before it has determined
+anything.  No completed pass can leave that behind, since every path out of
+ukphy_status() sets either a real subtype or IFM_NONE.  mii_linkchg() sees
+IFM_ACTIVE clear, reports the link as lost, and the interface drops its
+address.
+
+It is self-sustaining in practice.  Reacting to a link state change usually
+means querying interface media, and that query is itself another concurrent
+MII pass, so once the first torn read happens the condition tends to persist
+until something breaks the cycle.  On an AX88179B behind a busy WAN this
+presented as the link cycling several times a second, DHCP leases being
+dropped, and throughput collapsing to zero, with no error of any kind visible
+at the USB layer and no PHY reset issued by the driver.
+
+Serialise whole passes with a flag held across mii_tick(), mii_pollstat() and
+mii_mediachg().  A second mutex cannot be used for this, because the transfer
+sleeps; the flag is slept on with the existing driver lock, which the USB
+stack leaves alone.
+
+Measured on an AX88179B at gigabit, per 40 second window, before -> after:
+
+	link state changes	186 / 313 / 139  ->  0 / 0 / 0
+	miibus_statchg calls	659              ->  4
+	PHY register reads	57010            ->  4536
+	torn media words	170              ->  0
+
+An instrumented build counted 254 passes that had to wait for another to
+finish, so the overlap is real and frequent rather than a rare window.
+
+This is unlikely to be specific to axge(4).  Every USB ethernet driver that
+attaches a PHY through miibus(4) has the same structure and the same
+mutex-dropping control transfers underneath it.

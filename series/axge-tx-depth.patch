@@ -1,0 +1,133 @@
+--- a/sys/dev/usb/net/if_axge.c
++++ b/sys/dev/usb/net/if_axge.c
+@@ -158,16 +158,21 @@
+ #endif
+ 
+ static const struct usb_config axge_config[AXGE_N_TRANSFER] = {
+-	[AXGE_BULK_DT_WR] = {
+-		.type = UE_BULK,
+-		.endpoint = UE_ADDR_ANY,
+-		.direction = UE_DIR_OUT,
+-		.frames = AXGE_N_FRAMES,
+-		.bufsize = AXGE_N_FRAMES * MCLBYTES,
+-		.flags = {.pipe_bof = 1,.force_short_xfer = 1,},
+-		.callback = axge_bulk_write_callback,
+-		.timeout = 10000,	/* 10 seconds */
+-	},
++#define	AXGE_TX_XFER_CONFIG {						\
++		.type = UE_BULK,					\
++		.endpoint = UE_ADDR_ANY,				\
++		.direction = UE_DIR_OUT,				\
++		.frames = AXGE_N_FRAMES,				\
++		.bufsize = AXGE_N_FRAMES * MCLBYTES,			\
++		.flags = {.pipe_bof = 1,.force_short_xfer = 1,},	\
++		.callback = axge_bulk_write_callback,			\
++		.timeout = 10000,	/* 10 seconds */		\
++	}
++	[AXGE_BULK_DT_WR + 0] = AXGE_TX_XFER_CONFIG,
++	[AXGE_BULK_DT_WR + 1] = AXGE_TX_XFER_CONFIG,
++	[AXGE_BULK_DT_WR + 2] = AXGE_TX_XFER_CONFIG,
++	[AXGE_BULK_DT_WR + 3] = AXGE_TX_XFER_CONFIG,
++#undef	AXGE_TX_XFER_CONFIG
+ #define	AXGE_RX_XFER_CONFIG {						\
+ 		.type = UE_BULK,					\
+ 		.endpoint = UE_ADDR_ANY,				\
+@@ -184,6 +189,7 @@
+ #undef	AXGE_RX_XFER_CONFIG
+ };
+ CTASSERT(AXGE_N_RX_XFER == 4);
++CTASSERT(AXGE_N_TX_XFER == 4);
+ 
+ static device_method_t axge_methods[] = {
+ 	/* Device interface. */
+@@ -748,14 +754,16 @@
+ 		/* FALLTHROUGH */
+ 	case USB_ST_SETUP:
+ tr_setup:
+-		if ((sc->sc_flags & AXGE_FLAG_LINK) == 0 ||
+-		    (if_getdrvflags(ifp) & IFF_DRV_OACTIVE) != 0) {
+-			/*
+-			 * Don't send anything if there is no link or
+-			 * controller is busy.
+-			 */
++		if ((sc->sc_flags & AXGE_FLAG_LINK) == 0) {
++			/* Nothing to do without a link. */
+ 			return;
+ 		}
++		/*
++		 * Deliberately not gated on IFF_DRV_OACTIVE: with several
++		 * transmit transfers each one must be free to pick work up
++		 * while the others are on the wire.  Running out of packets
++		 * ends the loop below on its own.
++		 */
+ 
+ 		for (nframes = 0; nframes < AXGE_N_FRAMES &&
+ 		    !if_sendq_empty(ifp); nframes++) {
+@@ -809,7 +817,6 @@
+ 			if_inc_counter(ifp, IFCOUNTER_OPACKETS, nframes);
+ 			usbd_xfer_set_frames(xfer, nframes);
+ 			usbd_transfer_submit(xfer);
+-			if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, 0);
+ 		}
+ 		return;
+ 		/* NOTREACHED */
+@@ -901,7 +908,8 @@
+ 	 */
+ 	for (i = 0; i < AXGE_N_RX_XFER; i++)
+ 		usbd_transfer_start(sc->sc_xfer[AXGE_BULK_DT_RD + i]);
+-	usbd_transfer_start(sc->sc_xfer[AXGE_BULK_DT_WR]);
++	for (i = 0; i < AXGE_N_TX_XFER; i++)
++		usbd_transfer_start(sc->sc_xfer[AXGE_BULK_DT_WR + i]);
+ }
+ 
+ static void
+@@ -909,6 +917,7 @@
+ {
+ 	struct axge_softc *sc;
+ 	if_t ifp;
++	int i;
+ 
+ 	sc = uether_getsc(ue);
+ 	ifp = uether_getifp(ue);
+@@ -951,7 +960,8 @@
+ 	axge_write_cmd_2(sc, AXGE_ACCESS_MAC, 2, AXGE_MSR, MSR_GM | MSR_FD |
+ 	    MSR_RFC | MSR_TFC | MSR_RE);
+ 
+-	usbd_xfer_set_stall(sc->sc_xfer[AXGE_BULK_DT_WR]);
++	for (i = 0; i < AXGE_N_TX_XFER; i++)
++		usbd_xfer_set_stall(sc->sc_xfer[AXGE_BULK_DT_WR + i]);
+ 
+ 	if_setdrvflagbits(ifp, IFF_DRV_RUNNING, 0);
+ 	/* Switch to selected media. */
+@@ -982,7 +992,8 @@
+ 	/*
+ 	 * Stop all the transfers, if not already stopped:
+ 	 */
+-	usbd_transfer_stop(sc->sc_xfer[AXGE_BULK_DT_WR]);
++	for (i = 0; i < AXGE_N_TX_XFER; i++)
++		usbd_transfer_stop(sc->sc_xfer[AXGE_BULK_DT_WR + i]);
+ 	for (i = 0; i < AXGE_N_RX_XFER; i++)
+ 		usbd_transfer_stop(sc->sc_xfer[AXGE_BULK_DT_RD + i]);
+ }
+--- a/sys/dev/usb/net/if_axgereg.h
++++ b/sys/dev/usb/net/if_axgereg.h
+@@ -155,10 +155,18 @@
+  */
+ #define	AXGE_N_RX_XFER	4
+ 
++/*
++ * Transmit transfers kept in flight.  With one, IFF_DRV_OACTIVE is held for
++ * the whole time a batch is on the wire and nothing new is assembled behind
++ * it, which caps transmit the same way a single receive transfer capped
++ * receive.  if_ure(4) uses URE_MAX_TX 4 for the same reason.
++ */
++#define	AXGE_N_TX_XFER	4
++
+ /* The interrupt endpoint is currently unused by the ASIX part. */
+ enum {
+ 	AXGE_BULK_DT_WR,
+-	AXGE_BULK_DT_RD,
++	AXGE_BULK_DT_RD = AXGE_BULK_DT_WR + AXGE_N_TX_XFER,
+ 	AXGE_N_TRANSFER = AXGE_BULK_DT_RD + AXGE_N_RX_XFER,
+ };
+ 
